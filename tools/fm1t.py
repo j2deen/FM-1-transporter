@@ -7,14 +7,17 @@
     fm1t.py runapp         (leave UBOOT and boot the installed firmware)
     fm1t.py info
     fm1t.py dump out.bin [--addr 0] [--len 0x100000] [--compare ref.bin]
-    fm1t.py write --package FM-1_vNN.fwsc --ref earlier-dump.bin [--write]
+    fm1t.py check FM-1.fwsc                (offline: is this the official V15 package?)
+    fm1t.py write --package FM-1.fwsc --ref earlier-dump.bin [--write]
     fm1t.py selftest-write --ref earlier-dump.bin --sector 0x92000 [--write]
     fm1t.py ramrun IMAGE.bin [--addr 0x1C02000] [--clear A:N] [--poke A:V] [--read A:N]
 
 `write` follows fm-1-research-lab's restore policy, and is a dry run unless
 --write is given:
-  1. the package must pass fm1_ota.require_reviewed (stock V15, or a PASSED
-     hookcheck manifest; known-bad hashes refused);
+  1. the package must be the unmodified official V15 (FM-1.fwsc from M-VAVE,
+     pinned by sha256 and checked here). Any other package must pass
+     fm-1-research-lab's fm1_ota.require_reviewed (a PASSED hookcheck
+     manifest; known-bad hashes refused);
   2. chip key 980F and flash 856014;
   3. a fresh full read must equal --ref over the package region;
   4. only differing 4 KiB sectors are written; none may lie below 0x4000;
@@ -25,14 +28,17 @@ The firmware itself refuses any sector outside [0x4000, 0x93000).
 info/dump/write enter UBOOT by themselves when stock V15 is running on the
 transporter. A unit without working firmware needs the USB_KEY path: start
 the transporter with the FM-1 off (or `rekey`), then switch the FM-1 on.
-Requires pyserial, and fm-1-research-lab (FM1_RESEARCH, default
-~/fm-1-research-lab) for `write`.
+Requires pyserial. Writing the official V15 needs nothing else; writing any
+other package also needs fm-1-research-lab (FM1_RESEARCH, default
+~/fm-1-research-lab).
 """
 
 import argparse
+import binascii
 import glob
 import hashlib
 import os
+import struct
 import sys
 import time
 import zlib
@@ -203,22 +209,113 @@ def compare(ref_path, addr, data):
 WRITE_MIN = 0x4000     # flash header, SPL, isd_config below this: never written
 
 
+# The unmodified official FM-1 V15 package (FM-1.fwsc from M-VAVE). The digest
+# pins the whole file; the name of the file is not evidence.
+STOCK_V15_SHA256 = "db1642b2b6fa5c2cccb11ffd13878068bb28601678d3644049f99dc40e7edb8a"
+STOCK_V15_PRODUCT = "FM-1_015"
+STOCK_V15_FLASH_AT = 1044          # file offset of its flash image
+
+# .fwsc layout: a JieLi UFW container in which each of the first 20 blocks of
+# 0x30 bytes ends in one identity byte (the product name). Without those 20
+# bytes the file is the "logical" image, and the UFW offsets refer to that.
+FWSC_MARKS, FWSC_STEP = 20, 0x30
+UFW_HEAD, UFW_ENTRY = 0x40, 0x50
+UFW_FLASH = 0                      # entry type of the raw flash image
+
+
+def crc16(data):
+    return binascii.crc_hqx(data, 0)       # CRC-16/XMODEM, as in docs/PROTOCOL.md
+
+
+def jl_unmask(data, key=0xFFFF):
+    """JieLi header mask: XOR with the low byte of a CRC-16 style key stream."""
+    out = bytearray(data)
+    for i in range(len(out)):
+        out[i] ^= key & 0xFF
+        key = ((key << 1) ^ (0x1021 if key & 0x8000 else 0)) & 0xFFFF
+    return bytes(out)
+
+
+def parse_fwsc(raw):
+    """Return (flash image, product, file offset of the flash image) of an FM-1
+    .fwsc, checking every CRC on the way. The flash image is the type-0 entry,
+    byte-identical to raw flash from address 0. Raises ValueError."""
+    marked = FWSC_MARKS * FWSC_STEP
+    if len(raw) < marked:
+        raise ValueError("too short for an FM-1 package")
+    marks = raw[FWSC_STEP - 1:marked:FWSC_STEP]
+    product = "".join(chr((m - i - 1) & 0xFF) for i, m in enumerate(marks) if m != 0x7D)
+    table = b"".join(raw[i:i + FWSC_STEP - 1] for i in range(0, marked, FWSC_STEP))
+
+    head = jl_unmask(table[:UFW_HEAD])
+    head_crc, list_crc = struct.unpack_from("<HH", head, 0)
+    count, = struct.unpack_from("<H", head, 8)
+    if crc16(head[2:]) != head_crc:
+        raise ValueError("UFW header CRC mismatch (not an FM-1 .fwsc)")
+    end = UFW_HEAD + count * UFW_ENTRY
+    if end > len(table):
+        raise ValueError(f"UFW entry list too long ({count} entries)")
+    if crc16(table[UFW_HEAD:end]) != list_crc:
+        raise ValueError("UFW entry list CRC mismatch")
+
+    for off in range(UFW_HEAD, end, UFW_ENTRY):
+        typ, _, data_crc, _, data_off, size = struct.unpack_from(
+            "<HHHHII", jl_unmask(table[off:off + UFW_ENTRY]), 0)
+        if typ != UFW_FLASH:
+            continue
+        if data_off < len(table):
+            raise ValueError("flash image overlaps the package header")
+        start = data_off + FWSC_MARKS
+        img = raw[start:start + size]
+        if len(img) != size:
+            raise ValueError("flash image runs past the end of the file")
+        if crc16(img) != data_crc:
+            raise ValueError("flash image CRC mismatch")
+        return bytes(img), product, start
+    raise ValueError("no flash image in the package")
+
+
 def package_image(path):
-    """Gate the package with fm-1-research-lab's review check, then return its
-    type-0 flash entry (raw flash image from address 0)."""
+    """Gate the package, then return its flash image (raw flash from address 0)
+    and product name. The official V15 is checked here; any other package goes
+    through fm-1-research-lab's review check."""
+    raw = open(path, "rb").read()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != STOCK_V15_SHA256:
+        return reviewed_package_image(path, len(raw), digest)
+    try:
+        img, product, start = parse_fwsc(raw)
+    except ValueError as e:
+        sys.exit(f"fm1t: {path}: {e}")
+    if product != STOCK_V15_PRODUCT or start != STOCK_V15_FLASH_AT or len(img) != APP_END:
+        sys.exit(f"fm1t: {path}: official V15 digest but an unexpected layout "
+                 f"({product!r}, flash image {len(img):#x} bytes at {start}); refusing")
+    return img, product
+
+
+def reviewed_package_image(path, size, digest):
     research = os.path.expanduser(os.environ.get("FM1_RESEARCH", "~/fm-1-research-lab"))
     sys.path.insert(0, os.path.join(research, "tools"))
     try:
         from fm1_ota import require_reviewed
         from fm1fw import Firmware
     except ImportError as e:
-        sys.exit(f"fm1t: fm-1-research-lab tools not importable from {research} ({e}); "
-                 "refusing to write without the package review")
+        sys.exit(f"fm1t: {path} is not the official V15 FM-1.fwsc ({size} bytes, sha256 {digest}; "
+                 f"expected sha256 {STOCK_V15_SHA256}). Other packages need the review tools of "
+                 f"fm-1-research-lab, not importable from {research} ({e}); refusing")
     require_reviewed(path)     # exits on known-bad or unreviewed packages
     fw = Firmware(open(path, "rb").read())
     e = next(e for e in fw.entries if e["type"] == 0)
     img = bytes(fw.raw[e["data_off"] + fw.skew:e["data_off"] + fw.skew + e["size"]])
     return img, fw.product
+
+
+def cmd_check(args):
+    """Offline: gate the package exactly as `write` does and describe it."""
+    img, product = package_image(args.package)
+    print(f"{args.package}: accepted, product {product}; flash image {len(img):#x} bytes, "
+          f"sha256 {hashlib.sha256(img).hexdigest()[:16]}...")
+    print(f"`write` would only ever touch [{WRITE_MIN:#x}, {len(img):#x})")
 
 
 def cmd_write(s, args):
@@ -402,6 +499,8 @@ def main():
     d.add_argument("--addr", type=lambda x: int(x, 0), default=0)
     d.add_argument("--len", type=lambda x: int(x, 0), default=FLASH_SIZE)
     d.add_argument("--compare", help="reference image to compare against")
+    c = sub.add_parser("check")
+    c.add_argument("package", help=".fwsc to check, with no transporter connected")
     w = sub.add_parser("write")
     w.add_argument("--package", required=True, help=".fwsc whose flash image is written")
     w.add_argument("--ref", required=True, help="earlier full dump; a fresh read must equal it")
@@ -419,6 +518,8 @@ def main():
     r.add_argument("--read", type=span, action="append", default=[])
     args = ap.parse_args()
 
+    if args.cmd == "check":
+        return cmd_check(args)
     s = find_port(args.port)
     {"status": cmd_status, "uboot": cmd_uboot, "rekey": cmd_rekey, "runapp": cmd_runapp, "info": cmd_info, "dump": cmd_dump, "write": cmd_write,
      "selftest-write": cmd_selftest_write, "ramrun": cmd_ramrun}[args.cmd](s, args)

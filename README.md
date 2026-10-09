@@ -75,11 +75,17 @@ python3 tools/fm1t.py info
 python3 tools/fm1t.py dump backup.bin
 ```
 ```bash
-python3 tools/fm1t.py write --package FM-1_vNN.fwsc --ref backup.bin --write
+python3 tools/fm1t.py check FM-1.fwsc
+```
+```bash
+python3 tools/fm1t.py write --package FM-1.fwsc --ref backup.bin --write
 ```
 
 Without `--write`, `write` only checks and changes nothing.
 `write` は `--write` を付けない限り確認だけ行い、何も書き込みません。
+
+`write` accepts the unmodified official V15 (`FM-1.fwsc` from M-VAVE, pinned by sha256) with nothing else installed; `check` tests a file the same way without a transporter. Any other package also needs the review tools of fm-1-research-lab (`FM1_RESEARCH`).
+`write` は、無改変の純正 V15（M-VAVE の `FM-1.fwsc`、sha256 で固定）であれば追加のツールなしで受け付けます。`check` は Transporter なしで同じ確認を行います。それ以外のパッケージには fm-1-research-lab のレビューツール（`FM1_RESEARCH`）も必要です。
 
 ## Cautions / 注意事項
 
